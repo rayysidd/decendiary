@@ -3,7 +3,9 @@
 const sqlite3 = require('sqlite3').verbose();
 
 // Connect to a file-based database. The file will be created if it doesn't exist.
-const db = new sqlite3.Database('./diary.db', (err) => {
+// Use the disk mount path for production, but the local path for development
+const dbPath = process.env.NODE_ENV === 'production' ? '/var/data/diary.db' : './diary.db';
+const db = new sqlite3.Database(dbPath, (err) => {
   if (err) {
     console.error(err.message);
     throw err;
