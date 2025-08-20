@@ -1,39 +1,39 @@
-// database.js
+const { Pool } = require('pg');
 
-const sqlite3 = require('sqlite3').verbose();
-
-// Connect to a file-based database. The file will be created if it doesn't exist.
-// Use the disk mount path for production, but the local path for development
-const dbPath = process.env.NODE_ENV === 'production' ? '/var/data/diary.db' : './diary.db';
-const db = new sqlite3.Database(dbPath, (err) => {
-  if (err) {
-    console.error(err.message);
-    throw err;
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
   }
-  console.log('Connected to the SQLite database.');
 });
 
-// Use serialize to ensure table creation happens in order
-db.serialize(() => {
-  // Create the Users table
-  db.run(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL
-    )
-  `);
+const initializeDB = async () => {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL
+      )
+    `);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS entries (
+        id SERIAL PRIMARY KEY,
+        user_id INTEGER NOT NULL REFERENCES users(id),
+        encrypted_text TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL
+      )
+    `);
+    console.log('Database tables are ready.');
+  } catch (err) {
+    console.error('Error initializing database tables:', err);
+  } finally {
+    client.release();
+  }
+};
 
-  // Create the Entries table
-  db.run(`
-    CREATE TABLE IF NOT EXISTS entries (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      encrypted_text TEXT NOT NULL,
-      created_at TEXT NOT NULL,
-      FOREIGN KEY (user_id) REFERENCES users(id)
-    )
-  `);
-});
-
-module.exports = db;
+module.exports = {
+  query: (text, params) => pool.query(text, params),
+  initializeDB
+};

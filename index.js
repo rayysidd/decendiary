@@ -1,214 +1,196 @@
 // index.js
 
 // Load environment variables from .env file
-require('dotenv').config(); 
+require('dotenv').config();
 // Initialize database connection and create tables
-const db = require('./database.js'); 
+const db = require('./database.js');
+db.initializeDB();
+
 const { encrypt, decrypt } = require('./encryption.js');
 const express = require('express');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 
 const app = express();
-app.use(express.static('public')); 
-
-function getUser(userId, callback) {
-  const sql = `SELECT * FROM users WHERE id = ?`;
-  db.get(sql, [userId], (err, user) => {
-    callback(err, user);
-  });
-}
+// Serve static files from the "public" directory
+app.use(express.static('public'));
 // Middleware to parse incoming JSON requests
-app.use(express.json()); 
+app.use(express.json());
+
 // Middleware to authenticate JWT
 function authenticateToken(req, res, next) {
-  // Get the token from the Authorization header
-  // The header format is "Bearer TOKEN"
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
+  if (token == null) return res.sendStatus(401);
 
-  if (token == null) {
-    // No token provided
-    return res.sendStatus(401); // Unauthorized
-  }
-
-  // Verify the token
   jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-    if (err) {
-      // Token is invalid or expired
-      return res.sendStatus(403); // Forbidden
-    }
-
-    // Token is valid, attach the user payload to the request object
+    if (err) return res.sendStatus(403);
     req.user = user;
-    next(); // Proceed to the next middleware or route handler
+    next();
   });
 }
 
 const PORT = process.env.PORT || 3000;
 
-// API ROUTES 
+// --- API ROUTES ---
 
 // POST /api/register - Register a new user
 app.post('/api/register', async (req, res) => {
   try {
     const { username, password } = req.body;
-
-    // Basic validation
     if (!username || !password) {
       return res.status(400).json({ message: 'Username and password are required.' });
     }
-
-    // Hash the password using bcrypt
     const saltRounds = 10;
     const passwordHash = await bcrypt.hash(password, saltRounds);
 
-    // Insert the new user into the database
-    // Using a parameterized query to prevent SQL injection
-    const sql = `INSERT INTO users (username, password_hash) VALUES (?, ?)`;
-    db.run(sql, [username, passwordHash], function(err) {
-      if (err) {
-        // Check for unique constraint error (username already exists)
-        if (err.code === 'SQLITE_CONSTRAINT') {
-          return res.status(409).json({ message: 'Username already taken.' });
-        }
-        return res.status(500).json({ message: 'Database error', error: err.message });
-      }
-      res.status(201).json({ message: 'User created successfully', userId: this.lastID });
-    });
-  } catch (error) {
-    res.status(500).json({ message: 'Server error', error: error.message });
+    const sql = `INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id`;
+    const { rows } = await db.query(sql, [username, passwordHash]);
+    
+    res.status(201).json({ message: 'User created successfully', userId: rows[0].id });
+  } catch (err) {
+    // Check for unique constraint violation (Postgres error code '23505')
+    if (err.code === '23505') {
+      return res.status(409).json({ message: 'Username already taken.' });
+    }
+    res.status(500).json({ message: 'Server error', error: err.message });
   }
 });
 
 // POST /api/login - Authenticate a user and return a JWT
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body;
-
-  if (!username || !password) {
-    return res.status(400).json({ message: 'Username and password are required.' });
-  }
-
-  const sql = `SELECT * FROM users WHERE username = ?`;
-  db.get(sql, [username], async (err, user) => {
-    if (err) {
-      return res.status(500).json({ message: 'Database error', error: err.message });
+app.post('/api/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ message: 'Username and password are required.' });
     }
-    // Check if user exists
+    const sql = `SELECT * FROM users WHERE username = $1`;
+    const { rows } = await db.query(sql, [username]);
+    const user = rows[0];
+
     if (!user) {
       return res.status(401).json({ message: 'Invalid credentials.' });
     }
 
-    // Compare provided password with the stored hash
     const match = await bcrypt.compare(password, user.password_hash);
-
     if (!match) {
       return res.status(401).json({ message: 'Invalid credentials.' });
     }
 
-    // Passwords match, create a JWT
     const payload = { userId: user.id, username: user.username };
     const secret = process.env.JWT_SECRET;
-    const options = { expiresIn: '1h' }; // Token expires in 1 hour
-
-    const token = jwt.sign(payload, secret, options);
+    const token = jwt.sign(payload, secret, { expiresIn: '1h' });
 
     res.json({ message: 'Logged in successfully', token: token });
-  });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
 });
 
 // A protected route - only accessible with a valid JWT
 app.get('/api/profile', authenticateToken, (req, res) => {
-  // Thanks to the middleware, req.user is available here
-  res.json({ 
-    message: `Welcome, ${req.user.username}!`, 
-    userId: req.user.userId 
-  });
+  res.json({ message: `Welcome, ${req.user.username}!`, userId: req.user.userId });
 });
 
-
 // CREATE a new entry
-app.post('/api/entries', authenticateToken, (req, res) => {
-  const { entryText } = req.body;
-  const userId = req.user.userId;
-
-  if (!entryText) {
-    return res.status(400).json({ message: 'Entry text is required.' });
-  }
-
-  getUser(userId, (err, user) => {
-    if (err || !user) {
-      return res.status(500).json({ message: 'Error retrieving user data.' });
+app.post('/api/entries', authenticateToken, async (req, res) => {
+  try {
+    const { entryText } = req.body;
+    const userId = req.user.userId;
+    if (!entryText) {
+      return res.status(400).json({ message: 'Entry text is required.' });
     }
+
+    const userResult = await db.query('SELECT password_hash FROM users WHERE id = $1', [userId]);
+    if (userResult.rows.length === 0) {
+        return res.status(404).json({ message: 'User not found.' });
+    }
+    const user = userResult.rows[0];
+    
     const encryptedText = encrypt(entryText, user.password_hash);
-    const createdAt = new Date().toISOString();
-    const sql = `INSERT INTO entries (user_id, encrypted_text, created_at) VALUES (?, ?, ?)`;
-    db.run(sql, [userId, encryptedText, createdAt], function (err) {
-      if (err) return res.status(500).json({ message: 'Database error', error: err.message });
-      res.status(201).json({ id: this.lastID, created_at: createdAt });
-    });
-  });
+    const createdAt = new Date();
+
+    const sql = `INSERT INTO entries (user_id, encrypted_text, created_at) VALUES ($1, $2, $3) RETURNING id`;
+    const result = await db.query(sql, [userId, encryptedText, createdAt]);
+    
+    res.status(201).json({ id: result.rows[0].id, created_at: createdAt });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
 });
 
 // READ all entries for a user
-app.get('/api/entries', authenticateToken, (req, res) => {
-  const userId = req.user.userId;
-  getUser(userId, (err, user) => {
-    if (err || !user) {
-      return res.status(500).json({ message: 'Error retrieving user data.' });
+app.get('/api/entries', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.userId;
+    const userResult = await db.query('SELECT password_hash FROM users WHERE id = $1', [userId]);
+    if (userResult.rows.length === 0) {
+        return res.status(404).json({ message: 'User not found.' });
     }
-    const sql = `SELECT * FROM entries WHERE user_id = ? ORDER BY created_at DESC`;
-    db.all(sql, [userId], (err, rows) => {
-      if (err) return res.status(500).json({ message: 'Database error', error: err.message });
-      const decryptedEntries = rows.map(entry => {
-        try {
-          return { ...entry, encrypted_text: decrypt(entry.encrypted_text, user.password_hash) };
-        } catch (e) {
-          return { ...entry, encrypted_text: '[Decryption Failed]' };
-        }
-      });
-      res.json(decryptedEntries);
+    const user = userResult.rows[0];
+
+    const sql = `SELECT * FROM entries WHERE user_id = $1 ORDER BY created_at DESC`;
+    const { rows } = await db.query(sql, [userId]);
+    
+    const decryptedEntries = rows.map(entry => {
+      try {
+        return { ...entry, encrypted_text: decrypt(entry.encrypted_text, user.password_hash) };
+      } catch (e) {
+        return { ...entry, encrypted_text: '[Decryption Failed]' };
+      }
     });
-  });
+    res.json(decryptedEntries);
+  } catch (err) {
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
 });
 
 // UPDATE an entry
-app.put('/api/entries/:id', authenticateToken, (req, res) => {
-  const entryId = req.params.id;
-  const { entryText } = req.body;
-  const userId = req.user.userId;
+app.put('/api/entries/:id', authenticateToken, async (req, res) => {
+  try {
+    const entryId = req.params.id;
+    const { entryText } = req.body;
+    const userId = req.user.userId;
 
-  if (!entryText) {
-    return res.status(400).json({ message: 'Entry text is required.' });
-  }
-  
-  getUser(userId, (err, user) => {
-    if (err || !user) {
-      return res.status(500).json({ message: 'Error retrieving user data.' });
+    if (!entryText) {
+      return res.status(400).json({ message: 'Entry text is required.' });
     }
+    
+    const userResult = await db.query('SELECT password_hash FROM users WHERE id = $1', [userId]);
+    if (userResult.rows.length === 0) {
+        return res.status(404).json({ message: 'User not found.' });
+    }
+    const user = userResult.rows[0];
+
     const encryptedText = encrypt(entryText, user.password_hash);
-    // The "AND user_id = ?" is a crucial security check
-    const sql = `UPDATE entries SET encrypted_text = ? WHERE id = ? AND user_id = ?`;
-    db.run(sql, [encryptedText, entryId, userId], function (err) {
-      if (err) return res.status(500).json({ message: 'Database error', error: err.message });
-      if (this.changes === 0) return res.status(404).json({ message: 'Entry not found or user not authorized.' });
-      res.json({ message: 'Entry updated successfully.' });
-    });
-  });
+    const sql = `UPDATE entries SET encrypted_text = $1 WHERE id = $2 AND user_id = $3`;
+    const result = await db.query(sql, [encryptedText, entryId, userId]);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'Entry not found or user not authorized.' });
+    }
+    res.json({ message: 'Entry updated successfully.' });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
 });
 
 // DELETE an entry
-app.delete('/api/entries/:id', authenticateToken, (req, res) => {
-  const entryId = req.params.id;
-  const userId = req.user.userId;
-  
-  // The "AND user_id = ?" is a crucial security check
-  const sql = `DELETE FROM entries WHERE id = ? AND user_id = ?`;
-  db.run(sql, [entryId, userId], function (err) {
-    if (err) return res.status(500).json({ message: 'Database error', error: err.message });
-    if (this.changes === 0) return res.status(404).json({ message: 'Entry not found or user not authorized.' });
+app.delete('/api/entries/:id', authenticateToken, async (req, res) => {
+  try {
+    const entryId = req.params.id;
+    const userId = req.user.userId;
+    
+    const sql = `DELETE FROM entries WHERE id = $1 AND user_id = $2`;
+    const result = await db.query(sql, [entryId, userId]);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ message: 'Entry not found or user not authorized.' });
+    }
     res.json({ message: 'Entry deleted successfully.' });
-  });
+  } catch (err) {
+    res.status(500).json({ message: 'Server error', error: err.message });
+  }
 });
 
 app.listen(PORT, () => {
